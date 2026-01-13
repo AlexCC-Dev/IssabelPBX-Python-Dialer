@@ -1,0 +1,31 @@
+# --- SEGURIDAD ---
+# Ignorar archivo de variables de entorno (CRÍTICO)
+.env
+
+# --- DATOS ---
+# Ignorar la carpeta de archivos Excel para evitar subir datos de clientes
+excels/
+# También por si acaso archivos sueltos de Excel
+*.xlsx
+*.xls
+*.csv
+
+# --- PYTHON ---
+# Archivos de caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+# Entornos virtuales (si creas uno en la carpeta del proyecto)
+venv/
+env/
+.venv/
+
+# --- SISTEMA ---
+# Archivos basura de Windows y Mac
+Thumbs.db
+.DS_Store
+
+# --- IDEs ---
+# Configuraciones de VS Code o PyCharm
+.vscode/
+.idea/
