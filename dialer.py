@@ -1,15 +1,13 @@
 import asyncio
-import pandas as pd
+import psycopg2
 import os
 from panoramisk import Manager
-
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
-load_dotenv()
-# --- CONFIGURACIÓN ---
-# Solo cambia el nombre del archivo si subes uno nuevo
-RUTA_EXCEL = '/root/dialer-scripts/excels/TestNums.xlsx' 
-COLUMNA_TELEFONO = 'Telefono' # Nombre exacto de la columna
 
+load_dotenv()
+
+# --- CONFIGURACIÓN AMI (Asterisk) ---
 AMI_CONFIG = {
     'host': os.getenv('AMI_HOST', '127.0.0.1'),
     'port': int(os.getenv('AMI_PORT')), 
@@ -17,38 +15,46 @@ AMI_CONFIG = {
     'secret': os.getenv('AMI_PASS')
 }
 
+# --- CONFIGURACIÓN POSTGRES ---
+DB_CONFIG = {
+    "host": os.getenv("BD_HOST"),
+    "database": os.getenv("PG_DB"),
+    "user": os.getenv("PG_USER"),
+    "password": os.getenv("PG_PASS"),
+    "port": int(os.getenv("PG_PORT"))
+}
+
 EXTEN_AGENTE = '100' # Extensión de Liz
 
-async def cargar_datos(ruta):
-    if not os.path.exists(ruta):
-        print(f"[X] ERROR: No existe el archivo en {ruta}")
-        return None
-        
-    ext = os.path.splitext(ruta)[1].lower()
+def obtener_socios_de_bd():
+    """Conecta a la BD y trae a los socios con teléfonos válidos."""
+    query = """
+        SELECT nombre, contrato, telefono_1, telefono_2 
+        FROM socios 
+        WHERE (telefono_1 IS NOT NULL AND telefono_1 <> '')
+           OR (telefono_2 IS NOT NULL AND telefono_2 <> '');
+    """
     try:
-        if ext == '.csv':
-            return pd.read_csv(ruta, sep=None, engine='python')
-        elif ext == '.xlsx':
-            # Parche específico para el error de tu imagen
-            return pd.read_excel(ruta, engine='openpyxl')
-        elif ext == '.xls':
-            return pd.read_excel(ruta)
-        else:
-            print(f"[X] Formato {ext} no soportado.")
-            return None
+        conn = psycopg2.connect(**DB_CONFIG)
+        # RealDictCursor nos permite acceder a los datos por nombre de columna: socio['nombre']
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(query)
+        socios = cur.fetchall()
+        cur.close()
+        conn.close()
+        return socios
     except Exception as e:
-        print(f"[X] Error al leer el archivo {ext}: {e}")
-        return None
+        print(f"[X] ERROR al conectar con Postgres: {e}")
+        return []
 
-async def lanzar_llamada(manager, numero):
-    """Limpia el número y envía la acción a Asterisk"""
-    # Limpia formatos de Excel (quita .0 de los números)
-    tel_limpio = str(numero).split('.')[0].strip()
+async def lanzar_llamada(manager, numero, nombre, contrato):
+    """Limpia el número y envía la acción Originate a Asterisk"""
+    tel_limpio = str(numero).strip()
     
-    if not tel_limpio or tel_limpio == 'nan' or tel_limpio == '':
-        return
+    if not tel_limpio or tel_limpio.lower() == 'nan' or len(tel_limpio) < 7:
+        return False
 
-    print(f"[*] Marcando a: {tel_limpio}...")
+    print(f"[*] Marcando a: {nombre} ({tel_limpio}) | Contrato: {contrato}")
     
     action = {
         'Action': 'Originate',
@@ -56,47 +62,55 @@ async def lanzar_llamada(manager, numero):
         'Context': 'from-internal',
         'Exten': EXTEN_AGENTE,
         'Priority': '1',
-        'Async': 'true'
+        'Async': 'true',
+        'Variable': f'SOCIO_NOMBRE={nombre},SOCIO_CONTRATO={contrato}' # Variables útiles para el log de Asterisk
     }
 
     try:
         response = await manager.send_action(action)
-        print(f"[+] Orden enviada para {tel_limpio}: {response.Message}")
+        print(f"[+] Orden enviada para {nombre}: {response.Message}")
+        return True
     except Exception as e:
-        print(f"[!] Fallo al conectar llamada {tel_limpio}: {e}")
+        print(f"[!] Fallo al conectar llamada con {nombre}: {e}")
+        return False
 
 async def main():
-    # 1. Cargar el archivo según su extensión
-    df = await cargar_datos(RUTA_EXCEL)
-    if df is None: return
-
-    # 2. Validar que la columna exista
-    if COLUMNA_TELEFONO not in df.columns:
-        print(f"[X] ERROR: No existe la columna '{COLUMNA_TELEFONO}'")
-        print(f"Columnas encontradas: {df.columns.tolist()}")
+    # 1. Obtener datos de la Base de Datos
+    lista_socios = obtener_socios_de_bd()
+    
+    if not lista_socios:
+        print("[X] No hay socios con números de teléfono válidos para marcar.")
         return
 
-    lista_numeros = df[COLUMNA_TELEFONO].dropna().tolist()
-    print(f"[!] {len(lista_numeros)} números listos para marcar.")
+    print(f"[!] {len(lista_socios)} socios recuperados de la BD.")
 
-    # 3. Conexión AMI y Bucle de marcación
+    # 2. Conexión AMI
     manager = Manager(**AMI_CONFIG)
     try:
         await manager.connect()
-        print("[!] Conexión exitosa con Asterisk.")
+        print("[!] Conexión exitosa con Asterisk (AMI).")
 
-        for tel in lista_numeros:
-            await lanzar_llamada(manager, tel)
-            print(f"[*] Esperando 45s para la siguiente llamada...")
-            await asyncio.sleep(45) # Tiempo de gestión para Liz
+        for socio in lista_socios:
+            # Procesar Teléfono 1
+            if socio['telefono_1']:
+                await lanzar_llamada(manager, socio['telefono_1'], socio['nombre'], socio['contrato'])
+                print(f"[*] Esperando 45s para la siguiente gestión...")
+                await asyncio.sleep(45)
+
+            # Procesar Teléfono 2 (si existe)
+            if socio['telefono_2']:
+                print(f"[*] Socio {socio['nombre']} tiene un segundo número...")
+                await lanzar_llamada(manager, socio['telefono_2'], socio['nombre'], socio['contrato'])
+                print(f"[*] Esperando 45s para la siguiente gestión...")
+                await asyncio.sleep(45)
             
     except Exception as e:
         print(f"[X] Error de conexión AMI: {e}")
     finally:
         await manager.disconnect()
-        print("[!] Proceso finalizado.")
+        print("[!] Proceso de marcación finalizado.")
 
 if __name__ == "__main__":
-    # Compatible con Python 3.6 (Issabel estándar)
+    # Ejecución del bucle de eventos
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
