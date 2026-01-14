@@ -1,116 +1,176 @@
-import re
 import pandas as pd
-from openpyxl import load_workbook
+import re
+import psycopg2
+import os
+from datetime import datetime
+from dotenv import load_dotenv
 
-# Configuracion de rutas de archivos y nombres de columnas
-ARCHIVO_ENTRADA = "Informacion_Usuarios.xls"
-ARCHIVO_SALIDA  = "Informacion_Usuarios_telefonos_estandarizados.xlsx"
-COLUMNA_TELEFONO = "Celular"
+load_dotenv()
 
-# Columnas que no son relevantes para el proceso de marcado pero se mantienen en el registro
-COLUMNAS_OCULTAR = [
-    "Apellido Materno",
-    "Manager",
-    "Concepto",
-    "Idioma"
-]
+# ==========================================
+# 1. CONFIGURACIÓN
+# ==========================================
+DB_CONFIG = {
+    "host": os.getenv("BD_HOST"),
+    "database": os.getenv("PG_DB"),
+    "user": os.getenv("PG_USER"),
+    "password": os.getenv("PG_PASS"),
+    "port": int(os.getenv("PG_PORT"))
+}
 
-def normalize_candidates(cell):
-    """
-    Limpia y extrae numeros telefonicos de 10 digitos de una cadena de texto.
-    Maneja multiples delimitadores y limpia prefijos de marcacion comunes en Mexico.
-    """
-    if cell is None:
-        return []
-    s = str(cell).strip()
-    if not s:
-        return []
+RUTA_ENTRADA = "./entradas/"
+RUTA_SALIDA = "./salidas/"
 
-    # Divide la cadena si contiene multiples telefonos separados por coma o punto y coma
-    parts = [p.strip() for p in re.split(r"[;,]", s) if p.strip()]
-    nums = []
+# ==========================================
+# 2. FUNCIONES DE APOYO (Validadores)
+# ==========================================
 
-    for p in parts:
-        # Ignora valores nulos o no definidos explicitamente en el texto
-        if p.lower() in ("n/a", "na", "null", "none", "s/n"):
-            continue
+def limpiar_telefono(valor):
+    if pd.isna(valor) or str(valor).strip() == "" or str(valor).lower() in ['nan', 'na']:
+        return None
+    solo_numeros = re.sub(r'\D', '', str(valor))
+    return solo_numeros[-10:] if len(solo_numeros) >= 10 else solo_numeros
 
-        # Elimina cualquier caracter no numerico
-        digits = re.sub(r"\D", "", p)
+def safe_int(valor):
+    """Convierte a entero de forma segura. Si es 'NA' o texto, devuelve None."""
+    try:
+        if pd.isna(valor) or str(valor).strip().lower() in ['nan', 'na', 'n/a']:
+            return None
+        # Quitamos cualquier carácter no numérico por si acaso
+        num_str = re.sub(r'\D', '', str(valor))
+        return int(num_str) if num_str else None
+    except:
+        return None
 
-        # Reglas de normalizacion para estandarizar a 10 digitos (formato local MX)
-        if digits.startswith("01152"):
-            digits = digits[5:]
-        if digits.startswith("01") and len(digits) > 10:
-            digits = digits[2:]
-        if digits.startswith("52") and len(digits) >= 12:
-            digits = digits[-10:]
-        if len(digits) == 11 and digits.startswith("1"):
-            digits = digits[1:]
-        if len(digits) > 10:
-            digits = digits[-10:]
+def safe_decimal(valor):
+    """Convierte a flotante/decimal de forma segura."""
+    try:
+        if pd.isna(valor) or str(valor).strip().lower() in ['nan', 'na', 'n/a']:
+            return 0.0
+        return float(valor)
+    except:
+        return 0.0
 
-        # Solo se aceptan numeros que cumplen con la longitud de la red nacional
-        if len(digits) == 10:
-            nums.append(digits)
+# ==========================================
+# 3. ALGORITMOS DE BD
+# ==========================================
 
-    # Elimina duplicados manteniendo el orden original
-    return list(dict.fromkeys(nums))
+def algoritmo_escritura_registro(cur, df):
+    catalogos = {
+        'Pais Socio': ('paises', 'nombre_pais'),
+        'Estado Socio': ('estados', 'nombre_estado'),
+        'Ciudad Socio': ('ciudades', 'nombre_ciudad'),
+        'Idioma': ('idiomas', 'nombre_idioma'),
+        'Moneda': ('monedas', 'codigo_moneda'),
+        'Tipo Tarjeta': ('tipos_tarjeta', 'nombre_tipo'),
+        'Tipo cobro': ('tipos_cobro', 'nombre_cobro')
+    }
+    for col_excel, (tabla_bd, col_bd) in catalogos.items():
+        if col_excel in df.columns:
+            valores_unicos = df[col_excel].dropna().unique()
+            for valor in valores_unicos:
+                val_str = str(valor).strip()
+                if val_str == "" or val_str.lower() in ['nan', 'na']: continue
+                if col_excel == 'Moneda': val_str = val_str[:3].upper()
 
-def main():
-    """
-    Funcion principal: Orquesta la lectura, procesamiento y formateo del archivo Excel.
-    """
-    # Lectura inicial forzando tipos string para evitar truncamiento de ceros a la izquierda
-    df = pd.read_excel(ARCHIVO_ENTRADA, dtype=str)
+                cur.execute(f"SELECT 1 FROM {tabla_bd} WHERE {col_bd} = %s", (val_str,))
+                if not cur.fetchone():
+                    cur.execute(f"INSERT INTO {tabla_bd} ({col_bd}) VALUES (%s)", (val_str,))
 
-    # Aplicacion de logica de limpieza en la columna de origen
-    cands = df[COLUMNA_TELEFONO].apply(normalize_candidates)
-    
-    # Expansion de resultados a nuevas columnas de control
-    df["Celular_10"] = cands.apply(lambda x: x[0] if x else None)
-    df["Celular_Alt_10"] = cands.apply(lambda x: x[1] if len(x) > 1 else None)
-    
-    # Formato E164 simplificado para integracion directa con troncales SIP/Issabel
-    df["Celular_E164_MX"] = df["Celular_10"].apply(
-        lambda x: f"52{x}" if isinstance(x, str) and len(x) == 10 else None
-    )
+def algoritmo_comparar_asignar(cur, tabla, col_nombre_bd, val_excel):
+    if pd.isna(val_excel) or str(val_excel).strip() == "" or str(val_excel).lower() in ['nan', 'na']:
+        return None
+    val_busqueda = str(val_excel).strip()
+    if tabla == 'monedas': val_busqueda = val_busqueda[:3].upper()
 
-    # Persistencia inicial de datos procesados
-    df.to_excel(ARCHIVO_SALIDA, index=False)
+    mapeo_ids = {
+        'paises': 'id_pais', 'estados': 'id_estado', 'ciudades': 'id_ciudad',
+        'idiomas': 'id_idioma', 'monedas': 'id_moneda',
+        'tipos_tarjeta': 'id_tipo_tarjeta', 'tipos_cobro': 'id_tipo_cobro'
+    }
+    cur.execute(f"SELECT {mapeo_ids[tabla]} FROM {tabla} WHERE {col_nombre_bd} = %s", (val_busqueda,))
+    res = cur.fetchone()
+    return res[0] if res else None
 
-    # Post-procesamiento estético y funcional del archivo Excel mediante openpyxl
-    wb = load_workbook(ARCHIVO_SALIDA)
-    ws = wb.active
+# ==========================================
+# 4. PROCESAMIENTO PRINCIPAL
+# ==========================================
 
-    # Ajuste de altura de filas para mejorar la legibilidad en pantalla
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row):
-        ws.row_dimensions[row[0].row].height = 22
+def procesar_archivo_hibrido(nombre_archivo):
+    ruta_completa = os.path.join(RUTA_ENTRADA, nombre_archivo)
+    df = pd.read_excel(ruta_completa)
+    df.columns = df.columns.str.replace(r'\s+', ' ', regex=True).str.strip()
 
-    # Calculo dinamico del ancho de columnas segun el contenido
-    for column_cells in ws.columns:
-        max_length = 0
-        col_letter = column_cells[0].column_letter
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cur = conn.cursor()
 
-        for cell in column_cells:
-            if cell.value:
-                max_length = max(max_length, len(str(cell.value)))
+        algoritmo_escritura_registro(cur, df)
+        conn.commit()
 
-        ws.column_dimensions[col_letter].width = min(max(max_length + 4, 15), 45)
+        for index, row in df.iterrows():
+            try:
+                # 1. Estandarización de Apellidos
+                ape_p, ape_m = str(row.get('Apellido Paterno','')).strip(), str(row.get('Apellido Materno','')).strip()
+                apellido = f"{ape_p} {ape_m}".strip() if ape_m.lower() not in ['nan', 'na', ''] else ape_p
+                
+                # 2. Split de Teléfonos y Emails
+                t1, t2 = (limpiar_telefono(x) for x in (str(row.get('Celular','')).split(',') + [None])[:2])
+                m1, m2 = (str(x).strip() if x else None for x in (str(row.get('EMail','')).split(',') + [None])[:2])
 
-    # Mapeo de encabezados para aplicar ocultamiento de columnas especificas
-    header = {cell.value: cell.column_letter for cell in ws[1]}
-    for col_name in COLUMNAS_OCULTAR:
-        col_letter = header.get(col_name)
-        if col_letter:
-            ws.column_dimensions[col_letter].hidden = True
+                # 3. Evitar duplicados de Correo (Regla 36)
+                if m1:
+                    cur.execute("SELECT 1 FROM socios WHERE correo_1 = %s", (m1,))
+                    if cur.fetchone():
+                        print(f"Fila {index}: Correo {m1} ya existe. Omitiendo.")
+                        continue
 
-    # Inmovilizacion del panel superior para facilitar la navegacion en bases grandes
-    ws.freeze_panes = "A2"
+                # 4. Obtención de FKs
+                fks = {
+                    'p': algoritmo_comparar_asignar(cur, 'paises', 'nombre_pais', row.get('Pais Socio')),
+                    'e': algoritmo_comparar_asignar(cur, 'estados', 'nombre_estado', row.get('Estado Socio')),
+                    'c': algoritmo_comparar_asignar(cur, 'ciudades', 'nombre_ciudad', row.get('Ciudad Socio')),
+                    'i': algoritmo_comparar_asignar(cur, 'idiomas', 'nombre_idioma', row.get('Idioma')),
+                    'm': algoritmo_comparar_asignar(cur, 'monedas', 'codigo_moneda', row.get('Moneda')),
+                    'tt': algoritmo_comparar_asignar(cur, 'tipos_tarjeta', 'nombre_tipo', row.get('Tipo Tarjeta')),
+                    'tc': algoritmo_comparar_asignar(cur, 'tipos_cobro', 'nombre_cobro', row.get('Tipo cobro'))
+                }
 
-    # Guardado final de la version estandarizada
-    wb.save(ARCHIVO_SALIDA)
-    print("Excel generado exitosamente: Procesamiento de estandarizacion finalizado.")
+                # 5. Inserción con Safe Casting (Resuelve NA y Out of Range)
+                cur.execute("""
+                    INSERT INTO socios (
+                        nombre, apellido, fecha_venta, contrato, codigo_postal, direccion_socio,
+                        telefono_1, telefono_2, correo_1, correo_2, titular, numero_tarjeta,
+                        mes_tarjeta, anio_tarjeta, volumen_venta, pagare_total, plazo_total,
+                        tasa_interes, importe_mensualidad_intereses, fecha_compromiso_pago,
+                        mensualidades_pendientes_cobro, fecha_ultima_mensualidad_pagada,
+                        fecha_siguiente_mensualidad, mensualidades_vencidas,
+                        id_pais, id_estado, id_ciudad, id_idioma, id_moneda, id_tipo_tarjeta, id_tipo_cobro
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (
+                    row.get('Nombre Socio'), apellido, row.get('Fecha Venta'), str(row.get('Contrato'))[:15], 
+                    safe_int(row.get('Codigo Postal')), row.get('Direccion Socio'),
+                    t1, t2, m1, m2, row.get('Titular'), row.get('Numero Tarjeta'),
+                    safe_int(row.get('Mes Tarjeta')), safe_int(row.get('Año Tarjeta')), 
+                    safe_decimal(row.get('Volumen Venta')), safe_decimal(row.get('Pagare Total')), 
+                    safe_int(row.get('Plazo Total')), safe_int(row.get('Tasa Interes')), 
+                    safe_decimal(row.get('Importe Mensualidad Incluyendo Intereses')), row.get('Fecha Compromiso de Pago'),
+                    safe_int(row.get('No. Mensualidades Pendientes de Cobro')), row.get('Fecha Ult. Mensualidad Pagada'),
+                    row.get('Fecha Sig. Mensualidad'), safe_int(row.get('Men. Vencidas')),
+                    fks['p'], fks['e'], fks['c'], fks['i'], fks['m'], fks['tt'], fks['tc']
+                ))
+            except Exception as e_row:
+                conn.rollback()
+                print(f"Error en fila {index}: {e_row}")
+
+        conn.commit()
+        cur.execute("SELECT count(*) FROM socios;")
+        print(f"Carga finalizada. Registros en BD: {cur.fetchone()[0]}")
+
+    except Exception as e:
+        print(f"Fallo crítico: {e}")
+    finally:
+        if conn: conn.close()
 
 if __name__ == "__main__":
-    main()
+    procesar_archivo_hibrido("Informacion_Usuarios.xls")
