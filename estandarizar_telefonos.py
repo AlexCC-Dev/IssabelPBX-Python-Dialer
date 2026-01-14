@@ -32,18 +32,15 @@ def limpiar_telefono(valor):
     return solo_numeros[-10:] if len(solo_numeros) >= 10 else solo_numeros
 
 def safe_int(valor):
-    """Convierte a entero de forma segura. Si es 'NA' o texto, devuelve None."""
     try:
         if pd.isna(valor) or str(valor).strip().lower() in ['nan', 'na', 'n/a']:
             return None
-        # Quitamos cualquier carácter no numérico por si acaso
         num_str = re.sub(r'\D', '', str(valor))
         return int(num_str) if num_str else None
     except:
         return None
 
 def safe_decimal(valor):
-    """Convierte a flotante/decimal de forma segura."""
     try:
         if pd.isna(valor) or str(valor).strip().lower() in ['nan', 'na', 'n/a']:
             return 0.0
@@ -52,7 +49,7 @@ def safe_decimal(valor):
         return 0.0
 
 # ==========================================
-# 3. ALGORITMOS DE BD
+# 3. ALGORITMOS DE BASE DE DATOS
 # ==========================================
 
 def algoritmo_escritura_registro(cur, df):
@@ -101,31 +98,52 @@ def procesar_archivo_hibrido(nombre_archivo):
     df = pd.read_excel(ruta_completa)
     df.columns = df.columns.str.replace(r'\s+', ' ', regex=True).str.strip()
 
+    logs = {"db_status": [], "db_error": []}
+
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         cur = conn.cursor()
 
+        # FASE 1: Poblar catálogos
         algoritmo_escritura_registro(cur, df)
         conn.commit()
 
+        # FASE 2: Inserción de Socios
         for index, row in df.iterrows():
             try:
-                # 1. Estandarización de Apellidos
+                # --- Estandarización de Datos ---
                 ape_p, ape_m = str(row.get('Apellido Paterno','')).strip(), str(row.get('Apellido Materno','')).strip()
                 apellido = f"{ape_p} {ape_m}".strip() if ape_m.lower() not in ['nan', 'na', ''] else ape_p
                 
-                # 2. Split de Teléfonos y Emails
-                t1, t2 = (limpiar_telefono(x) for x in (str(row.get('Celular','')).split(',') + [None])[:2])
-                m1, m2 = (str(x).strip() if x else None for x in (str(row.get('EMail','')).split(',') + [None])[:2])
+                tels_raw = str(row.get('Celular', '')).split(',')
+                t1, t2 = (limpiar_telefono(x) for x in (tels_raw + [None])[:2])
+                
+                mails_raw = str(row.get('EMail', '')).split(',')
+                m1 = mails_raw[0].strip() if pd.notna(row.get('EMail')) and str(mails_raw[0]).lower() != 'nan' else None
+                m2 = mails_raw[1].strip() if len(mails_raw) > 1 and str(mails_raw[1]).lower() != 'nan' else None
 
-                # 3. Evitar duplicados de Correo (Regla 36)
+                contrato_val = str(row.get('Contrato'))[:15]
+
+                # --- VALIDACIÓN DE DUPLICADOS (Lógica de Descarte) ---
+                # 1. Verificar Correo
                 if m1:
                     cur.execute("SELECT 1 FROM socios WHERE correo_1 = %s", (m1,))
                     if cur.fetchone():
-                        print(f"Fila {index}: Correo {m1} ya existe. Omitiendo.")
+                        print(f"Fila {index}: Correo {m1} ya existe. Descartado.")
+                        logs["db_status"].append("Descartado")
+                        logs["db_error"].append(f"Correo duplicado: {m1}")
+                        continue
+                
+                # 2. Verificar Contrato (Basado en tu UNIQUE constraint)
+                if contrato_val:
+                    cur.execute("SELECT 1 FROM socios WHERE contrato = %s", (contrato_val,))
+                    if cur.fetchone():
+                        print(f"Fila {index}: Contrato {contrato_val} ya existe. Descartado.")
+                        logs["db_status"].append("Descartado")
+                        logs["db_error"].append(f"Contrato duplicado: {contrato_val}")
                         continue
 
-                # 4. Obtención de FKs
+                # --- Obtención de FKs ---
                 fks = {
                     'p': algoritmo_comparar_asignar(cur, 'paises', 'nombre_pais', row.get('Pais Socio')),
                     'e': algoritmo_comparar_asignar(cur, 'estados', 'nombre_estado', row.get('Estado Socio')),
@@ -136,7 +154,7 @@ def procesar_archivo_hibrido(nombre_archivo):
                     'tc': algoritmo_comparar_asignar(cur, 'tipos_cobro', 'nombre_cobro', row.get('Tipo cobro'))
                 }
 
-                # 5. Inserción con Safe Casting (Resuelve NA y Out of Range)
+                # --- Inserción Final ---
                 cur.execute("""
                     INSERT INTO socios (
                         nombre, apellido, fecha_venta, contrato, codigo_postal, direccion_socio,
@@ -148,7 +166,7 @@ def procesar_archivo_hibrido(nombre_archivo):
                         id_pais, id_estado, id_ciudad, id_idioma, id_moneda, id_tipo_tarjeta, id_tipo_cobro
                     ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (
-                    row.get('Nombre Socio'), apellido, row.get('Fecha Venta'), str(row.get('Contrato'))[:15], 
+                    row.get('Nombre Socio'), apellido, row.get('Fecha Venta'), contrato_val, 
                     safe_int(row.get('Codigo Postal')), row.get('Direccion Socio'),
                     t1, t2, m1, m2, row.get('Titular'), row.get('Numero Tarjeta'),
                     safe_int(row.get('Mes Tarjeta')), safe_int(row.get('Año Tarjeta')), 
@@ -159,13 +177,24 @@ def procesar_archivo_hibrido(nombre_archivo):
                     row.get('Fecha Sig. Mensualidad'), safe_int(row.get('Men. Vencidas')),
                     fks['p'], fks['e'], fks['c'], fks['i'], fks['m'], fks['tt'], fks['tc']
                 ))
+                logs["db_status"].append("Éxito")
+                logs["db_error"].append("-")
+
             except Exception as e_row:
                 conn.rollback()
                 print(f"Error en fila {index}: {e_row}")
+                logs["db_status"].append("Error")
+                logs["db_error"].append(str(e_row))
 
         conn.commit()
         cur.execute("SELECT count(*) FROM socios;")
-        print(f"Carga finalizada. Registros en BD: {cur.fetchone()[0]}")
+        print(f"Carga finalizada. Conteo en BD: {cur.fetchone()[0]}")
+
+        # Guardar log detallado
+        df['LOG_STATUS'] = logs["db_status"]
+        df['LOG_DETALLE'] = logs["db_error"]
+        nombre_salida = f"log_completo_{datetime.now().strftime('%H%M%S')}_{nombre_archivo}.xlsx"
+        df.to_excel(os.path.join(RUTA_SALIDA, nombre_salida), index=False)
 
     except Exception as e:
         print(f"Fallo crítico: {e}")
